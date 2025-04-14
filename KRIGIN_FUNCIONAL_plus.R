@@ -1,4 +1,20 @@
 # ===============================
+# 0. Configuración Inicial
+# ===============================
+library(Matrix)
+options(future.globals.maxSize = 1024 * 1024^2)  # Aumentar memoria para paralelismo
+
+# Configurar precisión numérica
+options(digits = 4, scipen = 999)
+
+# Función para matrices dispersas
+crear_matriz_cov <- function(tiempos, sigma2, alpha) {
+  dist_matrix <- as.matrix(dist(tiempos))
+  C <- sigma2 * exp(-dist_matrix / alpha)
+  Matrix(C, sparse = TRUE)
+}
+
+# ===============================
 # 1. Cargar librerías necesarias
 # ===============================
 library(sf)          # Para manejar datos geoespaciales
@@ -15,7 +31,7 @@ library(mvtnorm)     # Para manejo de distribuciones multivariadas y covarianzas
 # 2. Cargar y preparar los datos 
 # ===============================
 # Leer datos geoespaciales desde archivo JSON
-gdf <- st_read("G:/Univalle/puntos_proyect.json") 
+gdf <- st_read("G:/Univalle/puntos_generados_espo.geojson") 
 
 # Verificación de estructura de datos
 if(!"DATE" %in% names(gdf)) stop("La columna DATE no existe en los datos")
@@ -39,48 +55,95 @@ ggplot(gdf_df, aes(X, Y, color = DATE)) +
 # 3. Análisis Funcional 
 # ===============================
 # Definición de puntos comunes para interpolación
-X_common <- seq(min(gdf_df$X), max(gdf_df$X), length.out = 100)
+X_common <- seq(min(gdf_df$X), max(gdf_df$X), length.out = 500)
 
-# Función de interpolación segura con manejo de errores
+# Función de interpolación segura con manejo de NA
 safe_interp <- function(x, y, xout) {
   tryCatch({
     approx(x, y, xout = xout, rule = 2)$y
   }, error = function(e) {
-    warning("Error en interpolación: ", e$message)
+    warning("Error en interpolación para la fecha: ", unique(.x$DATE))
     rep(NA, length(xout))
   })
 }
 
-# Interpolación 
+# Generar Y_matrix con verificación de integridad
 Y_matrix <- gdf_df %>%
   group_by(DATE) %>%
-  group_map(~ safe_interp(.x$X, .x$Y, X_common)) %>%
-  purrr::discard(~any(is.na(.x))) %>%
+  group_map(~ {
+    # Filtrar grupos con al menos 2 puntos para interpolación
+    if (nrow(.x) >= 2) {
+      safe_interp(.x$X, .x$Y, X_common)
+    } else {
+      warning("Fecha ", .x$DATE[1], " tiene menos de 2 puntos. Omitiendo.")
+      rep(NA, length(X_common))
+    }
+  }) %>%
+  purrr::discard(~ all(is.na(.x))) %>%  # Eliminar columnas totalmente NA
   do.call(cbind, .)
 
-# Función para selección óptima de bases B-spline usando validación cruzada
-cv_basis <- function(data, max_basis = 15) {
-  cv_errors <- sapply(5:max_basis, function(nb) {
-    basis <- create.bspline.basis(range(X_common), nbasis = nb)
-    fdPar <- fdPar(basis)
-    mean(smooth.basis(X_common, data, fdPar)$SSE)
-  })
-  which.min(cv_errors) + 4
+# Verificación crítica de Y_matrix
+if (ncol(Y_matrix) == 0) stop("Y_matrix está vacío. Revise los datos de entrada.")
+if (anyNA(Y_matrix)) warning("Y_matrix contiene NA. Considerar imputación.")
+
+library(fda)
+
+# Parámetros basados en la escala espacial
+rango_X <- max(X_common) - min(X_common)  # ~730 metros (en grados)
+escala_metros <- 5
+nbasis_meta <- round((rango_X / escala_metros) * 0.5)  # ~73
+lambda_inicial <- 1e-8
+
+# Función de validación cruzada para lambda y nbasis
+cv_escala <- function(data, n_basis_vec = seq(60, 80, 5), lambda_vec = 10^seq(-10, -5, 1)) {
+  best_error <- Inf
+  best_params <- list(nbasis = NA, lambda = NA)
+  
+  for (nb in n_basis_vec) {
+    basis <- create.bspline.basis(range(X_common), nbasis = nb, norder = 4)
+    for (lam in lambda_vec) {
+      fdPar_obj <- fdPar(basis, lambda = lam)
+      error <- mean(smooth.basis(X_common, data, fdPar_obj)$SSE)
+      if (error < best_error) {
+        best_error <- error
+        best_params <- list(nbasis = nb, lambda = lam)
+      }
+    }
+  }
+  return(best_params)
 }
 
-# Creación de base óptima y objeto funcional
-optimal_basis <- cv_basis(Y_matrix)
-fd_basis <- create.bspline.basis(range(X_common), nbasis = optimal_basis)
-fd_obj <- Data2fd(X_common, Y_matrix, fd_basis)
+# Optimizar parámetros
+optimal_params <- cv_escala(Y_matrix)
 
-# Visualización de curvas funcionales
-plot(fd_obj, main = "Representación Funcional de la Línea de Costa")
+# Ajuste final con parámetros óptimos
+final_basis <- create.bspline.basis(range(X_common), 
+                                    nbasis = optimal_params$nbasis, 
+                                    norder = 4)
+final_fdPar <- fdPar(final_basis, lambda = optimal_params$lambda)
+fd_obj <- smooth.basis(X_common, Y_matrix, final_fdPar)
+
+# Verificación
+if (any(is.na(fd_obj$fd$coefs))) {
+  warning("Ajuste inestable. Incrementar lambda o reducir nbasis.")
+} else {
+  cat("Parámetros finales:",
+      "\n- nbasis =", optimal_params$nbasis,
+      "\n- lambda =", optimal_params$lambda)
+}
+
+# Plot de las funciones base
+plot(final_basis, main = "Funciones Base B-spline")
+
+# Plot de todas las curvas funcionales
+plot(fd_obj$fd, main = "Representación Funcional de la Línea de Costa",
+     xlab = "Coordenada X", ylab = "Coordenada Y")
 
 # ===============================
 # 4. FPCA y Selección de Componentes 
 # ===============================
 # Análisis de componentes principales funcionales
-fpca <- pca.fd(fd_obj, nharm = 10)
+fpca <- pca.fd(fd_obj$fd, nharm = 10)
 
 # Asignación de nombres a los scores
 colnames(fpca$scores) <- paste0("score.", 1:ncol(fpca$scores))
@@ -89,7 +152,24 @@ colnames(fpca$scores) <- paste0("score.", 1:ncol(fpca$scores))
 cumvar <- cumsum(fpca$values)/sum(fpca$values)
 n_components <- which(cumvar >= 0.95)[1]
 fpca$harmonics <- fpca$harmonics[1:n_components]
-fpca$scores <- fpca$scores[, 1:n_components, drop = FALSE]  # Mantener estructura de matriz
+fpca$scores <- fpca$scores[, 1:n_components, drop = FALSE]  
+# ============================================
+# 4.1 Detección y Corrección de Tendencias
+# ============================================
+
+# Detectar y remover tendencias temporales en los scores
+observed_times_fpca <- sapply(unique(gdf_df$DATE), function(d) {
+  as.numeric(format(d, "%Y")) + as.numeric(format(d, "%j"))/365
+})
+
+for(i in 1:n_components) {
+  trend_model <- lm(fpca$scores[,i] ~ observed_times_fpca)
+  if(anova(trend_model)$'Pr(>F)'[1] < 0.05) {  # Si hay tendencia significativa
+    fpca$scores[,i] <- residuals(trend_model)
+    message("Componente ", i, ": Tendencia removida (p=", 
+            signif(anova(trend_model)$'Pr(>F)'[1], 3), ")")
+  }
+}
 
 # ===============================
 # 5. MODELADO TEMPORAL CON KRIGING
@@ -112,6 +192,7 @@ coordinates(data_vario) <- ~ time + y
 if(!inherits(data_vario, "SpatialPointsDataFrame")) {
   stop("Error en conversión a objeto espacial")
 }
+
 # ===============================
 # 5.2 Función de ajuste de variogramas
 # ===============================
@@ -232,30 +313,6 @@ print(paste("Número de componentes activos:", length(componentes_activos)))
 print(head(data_vario))
 print(summary(varianzas))
 
-# 5.4 Validación y visualización
-# ---------------------------------------------------------------
-x11()
-if(length(componentes_activos) > 0) {
-  # Configuración de ventana gráfica múltiple
-  dev.new()  # Nueva ventana gráfica
-  par(mfrow = c(ceiling(length(componentes_activos)/2), 2), mar = c(4,4,2,1))
-  
-  # Graficar variogramas para cada componente
-  for(i in seq_along(componentes_activos)) {
-    idx <- componentes_activos[i]
-    vgm_emp <- variogram(reformulate("1", paste0("score.", idx)), data_vario)
-    
-    if(nrow(vgm_emp) > 0) {  # Verificar datos
-      plot(vgm_emp, fit_list[[i]], 
-           main = paste("Componente", idx, "\nVar:", round(varianzas[idx], 2)),
-           col = "darkred", pch = 19)
-    } else {
-      message("Variograma empírico vacío para componente ", idx)
-    }
-  }
-} else {
-  warning("No hay componentes activos para graficar")
-}
 # ===============================
 # 6. Predicción y Incertidumbre (Con covarianza)
 # ===============================
@@ -288,7 +345,7 @@ predict_scores <- function(target_date) {
 # Función para reconstruir la curva con intervalos de confianza
 reconstruct_curve <- function(scores_pred, cov_matrix) {
   harmonics <- fpca$harmonics
-  mean_curve <- eval.fd(X_common, mean.fd(fd_obj))
+  mean_curve <- eval.fd(X_common, mean.fd(fd_obj$fd))  # Corregido aquí
   
   # Reconstrucción de la curva media
   reconstructed <- mean_curve + rowSums(sapply(1:n_components, function(i) {
@@ -336,7 +393,7 @@ temporal_cv <- function() {
 # Ejecución de validación cruzada
 cv_results <- temporal_cv()
 message("\nResultados Validación Cruzada:")
-message("RMSE Promedio: ", round(cv_results$rmse, 2))
+message("RMSE Promedio: ", round(cv_results$rmse, 6))
 message("Cobertura IC 95%: ", round(cv_results$coverage * 100, 1), "%")
 
 # ===============================
@@ -901,4 +958,5 @@ if(!is.null(cv_metrics)) {
 } else {
   warning("No se pudo generar el resumen de diagnóstico por falta de datos")
 }
+
 
