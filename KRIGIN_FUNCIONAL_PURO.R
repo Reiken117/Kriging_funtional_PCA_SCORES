@@ -16,7 +16,7 @@ library(purrr)       # Para funciones de mapeo
 # 2. Cargar y preparar los datos 
 # ===================================================
 # Leer datos geoespaciales desde archivo JSON
-gdf <- st_read("G:/Univalle/puntos_generados_espo_9377.geojson") 
+gdf <- st_read("G:/Univalle/puntos_generados.geojson") 
 
 # Verificación de la estructura de datos
 if(!"DATE" %in% names(gdf)) stop("La columna DATE no existe en los datos")
@@ -71,10 +71,10 @@ if (ncol(Y_matrix) == 0)
 if (anyNA(Y_matrix)) 
   warning("Y_matrix contiene NA. Considerar imputación.")
 
-# -----------------------
-# 3.A. Optimización de Parámetros de Suavizado
-# -----------------------
-# (i) Optimización automática con optim
+
+# ===================================================
+# 3.1 Optimización automática con optim
+# ---------------------------------------
 optimize_fdPar <- function(data, X_common) {
   error_fun <- function(params) {
     nbasis <- round(params[1])
@@ -89,7 +89,9 @@ optimize_fdPar <- function(data, X_common) {
   list(nbasis = round(res$par[1]), lambda = 10^(res$par[2]))
 }
 
-# (ii) Análisis de sensibilidad (grid search)
+# ===================================================
+# 3.2 Análisis de sensibilidad (grid search)
+# ---------------------------------------
 sensitivity_analysis <- function(data, X_common, nbasis_vec = seq(60, 80, 2), 
                                  lambda_vec = 10^seq(-10, -5, 1)) {
   results <- expand.grid(nbasis = nbasis_vec, lambda = lambda_vec)
@@ -119,7 +121,6 @@ ggplot(sens_results, aes(x = nbasis, y = log10(lambda), fill = error)) +
        x = "nbasis", y = "log10(lambda)") +
   theme_minimal()
 
-# -----------------------
 # Ajuste final: Se utiliza la función cv_escala modificada o se elige la optimización
 # Aquí empleamos el método original para mantener la funcionalidad
 cv_escala <- function(data, n_basis_vec = seq(60, 80, 5), lambda_vec = 10^seq(-10, -5, 1)) {
@@ -139,7 +140,7 @@ cv_escala <- function(data, n_basis_vec = seq(60, 80, 5), lambda_vec = 10^seq(-1
   return(best_params)
 }
 
-# Optimizar parámetros (alternativamente puedes emplear el método optim anterior)
+# Optimizar parámetros
 optimal_params <- cv_escala(Y_matrix)
 final_basis <- create.bspline.basis(range(X_common), nbasis = optimal_params$nbasis, norder = 4)
 final_fdPar <- fdPar(final_basis, lambda = optimal_params$lambda)
@@ -170,7 +171,9 @@ fpca$scores <- fpca$scores[, 1:n_components, drop = FALSE]
 # ===================================================
 # 5. Modelado Temporal con Kriging
 # ===================================================
+# ===================================================
 # 5.1 Preparación de datos espaciales
+# ===================================================
 dates_numeric <- as.numeric(format(gdf_df$DATE, "%Y")) +
   as.numeric(format(gdf_df$DATE, "%j")) / 365
 
@@ -186,9 +189,9 @@ if(!inherits(data_vario, "SpatialPointsDataFrame")) {
   stop("Error en conversión a objeto espacial")
 }
 
-# -----------------------
-# 5.2 Función extendida de ajuste de variogramas
-# -----------------------
+# ===================================================
+# 5.2 Función de ajuste de variogramas
+# ===================================================
 fit_variogram_robust_ext <- function(formula, sp_data) {
   environment(formula) <- environment()
   nombre_variable <- all.vars(formula)[1]
@@ -264,9 +267,9 @@ fit_variogram_robust_ext <- function(formula, sp_data) {
   return(mejor_ajuste)
 }
 
-# -----------------------
+# ===================================================
 # 5.3 Ajuste de variogramas por componente
-# -----------------------
+# ===================================================
 varianzas <- apply(fpca$scores, 2, var)
 umbral_varianza <- 0.01 * max(varianzas)
 componentes_activos <- which(varianzas > umbral_varianza)
@@ -290,9 +293,9 @@ print(paste("Número de componentes activos:", length(componentes_activos)))
 print(head(data_vario))
 print(summary(varianzas))
 
-# -----------------------
+# ===================================================
 # 5.4 Validación y visualización de variogramas por componente
-# -----------------------
+# ===================================================
 x11()
 if (length(componentes_activos) > 0) {
   dev.new()
@@ -312,9 +315,9 @@ if (length(componentes_activos) > 0) {
   warning("No hay componentes activos para graficar")
 }
 
-# -----------------------
+# ===================================================
 # 5.5 Ejemplo de Kriging Universal (con tendencia)
-# -----------------------
+# ===================================================
 library(dplyr)
 library(tidyr)
 library(ggplot2)
@@ -407,7 +410,7 @@ predict_universal_curve_df <- function(target_dates, trend = TRUE) {
   bind_rows(res_list)
 }
 
-# -----------------------
+# ===================================================
 # 5.5.1 Función de graficación
 # -----------------------
 
@@ -439,10 +442,9 @@ pred_df <- predict_universal_curve_df(fechas, trend = TRUE)
 plot_predicted_curves(pred_df, ci = TRUE)
 
 
-# -----------------------
+# ===================================================
 # 5.5.2  validación cruzada temporal
 # -----------------------
-
 # Función de validación cruzada para Kriging Universal con mejoras
 cross_validate_kriging_universal <- function(years_ahead = 1:10, trend = TRUE) {
   unique_dates <- sort(unique(gdf_df$DATE))
@@ -522,10 +524,13 @@ plot_cv_results <- function(cv_df) {
 cv_result <- cross_validate_kriging_universal(years_ahead = 1:8)
 plot_cv_results(cv_result)
 
+
 # ===================================================
 # 6. Predicción Funcional y Visualización (Kriging Funcional Puro)
 # ===================================================
-target_date <- as.Date("2025-01-01")
+
+target_date <- as.Date("2025-01-01") #fecha que se busca estimar mediante kriging funcional puro
+
 predict_functional_curve <- function(target_date) {
   if (inherits(target_date, "Date")) {
     target_time <- as.numeric(format(target_date, "%Y")) +
@@ -697,7 +702,7 @@ plot_ly(data = df_boot, x = ~X) %>%
          yaxis = list(title = "Y Relativa"))
 
 # ===================================================
-# 9. Validación Estadística y Diagnóstico Adicional
+# 9. Validación Estadística y Diagnóstico 
 # ===================================================
 # 9.1 Matriz de Covarianza entre Curvas Funcionales
 observed_times <- sapply(sort(unique(gdf_df$DATE)), function(d) {
@@ -761,4 +766,3 @@ ggplot(cv_resultados, aes(x = Fecha)) +
   labs(title = "Cobertura Empírica de IC 95% por Fecha",
        y = "Cobertura", x = "Fecha") +
   theme_minimal()
-
