@@ -11,7 +11,7 @@ library(plotly)      # Visualización 3D interactiva
 library(viridis)     # Escalas de color
 library(mvtnorm)     # Para manejo de distribuciones multivariadas y covarianzas
 library(purrr)       # Para funciones de mapeo
-
+library(tidyr)
 # ===================================================
 # 2. Cargar y preparar los datos 
 # ===================================================
@@ -74,7 +74,7 @@ if (anyNA(Y_matrix))
 
 # ===================================================
 # 3.1 Optimización automática con optim
-# ---------------------------------------
+# ===================================================
 optimize_fdPar <- function(data, X_common) {
   error_fun <- function(params) {
     nbasis <- round(params[1])
@@ -91,8 +91,8 @@ optimize_fdPar <- function(data, X_common) {
 
 # ===================================================
 # 3.2 Análisis de sensibilidad (grid search)
-# ---------------------------------------
-sensitivity_analysis <- function(data, X_common, nbasis_vec = seq(60, 80, 2), 
+# ===================================================
+sensitivity_analysis <- function(data, X_common, nbasis_vec = seq(20, 80, 2), 
                                  lambda_vec = 10^seq(-10, -5, 1)) {
   results <- expand.grid(nbasis = nbasis_vec, lambda = lambda_vec)
   results$error <- NA
@@ -158,6 +158,93 @@ plot(final_basis, main = "Funciones Base B-spline")
 plot(fd_obj$fd, main = "Representación Funcional de la Línea de Costa",
      xlab = "Coordenada X", ylab = "Coordenada Y")
 
+# ===================================================
+# 3.3 Análisis Funcional con Selección de Modelos por AIC
+# ===================================================
+
+# Función para ajustar y seleccionar el mejor modelo por AIC
+ajustar_mejor_modelo <- function(x, y) {
+  datos <- data.frame(x = x, y = y)
+  datos <- datos[complete.cases(datos), ]
+  
+  if (nrow(datos) < 4) {
+    warning("No hay suficientes puntos para ajustar modelos. Usando interpolación lineal.")
+    return(approx(datos$x, datos$y, xout = x, rule = 2)$y)
+  }
+  
+  tryCatch({
+    # Ajustamos ambos modelos
+    m_ps <- mgcv::gam(y ~ s(x, bs = "ps"), data = datos, method = "GCV.Cp")
+    m_bs <- mgcv::gam(y ~ s(x, bs = "bs"), data = datos, method = "GCV.Cp")
+    
+    # Comparamos por AIC
+    aic_ps <- AIC(m_ps)
+    aic_bs <- AIC(m_bs)
+    
+    # Seleccionamos el mejor modelo
+    if (aic_ps < aic_bs) {
+      predict(m_ps, newdata = data.frame(x = x))
+    } else {
+      predict(m_bs, newdata = data.frame(x = x))
+    }
+  }, error = function(e) {
+    warning("Error en ajuste GAM: ", e$message, ". Usando interpolación lineal.")
+    approx(datos$x, datos$y, xout = x, rule = 2)$y
+  })
+}
+
+# Aplicamos a cada columna de Y_matrix
+Y_smooth <- purrr::map_dfc(1:ncol(Y_matrix), function(j) {
+  yj <- Y_matrix[, j]
+  smooth_curve <- ajustar_mejor_modelo(X_common, yj)
+  data.frame(smooth_curve)
+}) %>% as.matrix()
+# Renombramos columnas para mantener referencia a fechas
+colnames(Y_smooth) <- colnames(Y_matrix)
+
+# Análisis de qué modelos fueron seleccionados
+model_selection <- sapply(1:ncol(Y_matrix), function(j) {
+  yj <- Y_matrix[, j]
+  datos <- data.frame(x = X_common, y = yj)
+  datos <- datos[complete.cases(datos), ]
+  
+  m_ps <- mgcv::gam(y ~ s(x, bs = "ps"), data = datos, method = "GCV.Cp")
+  m_bs <- mgcv::gam(y ~ s(x, bs = "bs"), data = datos, method = "GCV.Cp")
+  
+  ifelse(AIC(m_ps) < AIC(m_bs), "P-spline", "B-spline")
+})
+
+cat("\nDistribución de modelos seleccionados:\n")
+print(table(model_selection))
+
+# Convertir a formato largo para ggplot
+Y_smooth_df <- as.data.frame(Y_smooth)
+colnames(Y_smooth_df) <- unique(gdf_df$DATE)[1:ncol(Y_smooth)]  # Asegurar misma longitud
+Y_smooth_df$X <- X_common
+
+long_data <- Y_smooth_df %>%
+  tidyr::pivot_longer(-X, names_to = "DATE", values_to = "Y") %>%
+  mutate(DATE = as.Date(DATE))
+
+# 3. Visualización mejorada con facetas por año
+library(lubridate)  # Para manejo de fechas
+
+# Añadir columnas de año y mes
+long_data <- long_data %>%
+  mutate(Year = year(DATE),
+         Month = month(DATE, label = TRUE))
+
+# Gráfico por años con colores por mes
+ggplot(long_data, aes(X, Y, group = DATE, color = Month)) +
+  geom_line(alpha = 0.7) +
+  scale_color_viridis_d() +
+  facet_wrap(~Year, scales = "free_y") +
+  labs(title = "Líneas Costeras Suavizadas por Fecha",
+       subtitle = "Separado por años, colores representan meses",
+       x = "Coordenada X", y = "Coordenada Y") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
 # ===================================================
 # 4. FPCA y Selección de Componentes 
 # ===================================================
@@ -263,7 +350,6 @@ fit_variogram_robust_ext <- function(formula, sp_data) {
     warning("No se encontró modelo adecuado para ", nombre_variable, ". Usando modelo Nugget.")
     mejor_ajuste <- vgm(var_inicial, "Nug", 0)
   }
-  
   return(mejor_ajuste)
 }
 
@@ -318,101 +404,82 @@ if (length(componentes_activos) > 0) {
 # ===================================================
 # 5.5 Ejemplo de Kriging Universal (con tendencia)
 # ===================================================
-library(dplyr)
-library(tidyr)
-library(ggplot2)
+
+estimate_alpha_MLE <- function(observed_times, Y_matrix) {
+  Y_centered <- scale(Y_matrix, scale = FALSE)
+  
+  neg_loglik <- function(params) {
+    alpha <- exp(params[1])
+    sigma2 <- exp(params[2])
+    
+    C <- sigma2 * exp(-outer(observed_times, observed_times, function(t1,t2) abs(t1-t2))/alpha)
+    diag(C) <- diag(C) + 1e-6 * median(diag(C))
+    
+    tryCatch({
+      -sum(mvtnorm::dmvnorm(Y_centered, mean = rep(0, ncol(Y_centered)), sigma = C, log = TRUE)) # ✅ Suma crítica
+    }, error = function(e) 1e10)
+  }
+  
+  init_params <- log(c(diff(range(observed_times))/2, var(as.vector(Y_matrix))))
+  opt <- optim(init_params, neg_loglik, method = "Nelder-Mead", control = list(maxit = 10000))
+  
+  return(list(alpha = exp(opt$par[1]), sigma2 = exp(opt$par[2])))
+}
+
 
 # Función de predicción robusta con regularización y validación
-predict_universal_curve_df <- function(target_dates, trend = TRUE) {
-  # Conversión de fechas o tiempos
-  if (inherits(target_dates, "Date")) {
-    raw_target_times <- sapply(target_dates, function(d) {
-      as.numeric(format(d, "%Y")) + as.numeric(format(d, "%j")) / 365
-    })
-  } else {
-    raw_target_times <- target_dates
-    target_dates <- as.Date(paste0(floor(raw_target_times), "-01-01"))
-  }
-  
-  # Extraer y reescalar los tiempos observados
+predict_universal_curve_df <- function(target_dates, trend = TRUE, verbose = FALSE) {
+  # Conversión de fechas a tiempos normalizados
   unique_dates <- sort(unique(gdf_df$DATE))
-  raw_times <- sapply(unique_dates, function(d) {
-    as.numeric(format(d, "%Y")) + as.numeric(format(d, "%j")) / 365
-  })
+  raw_times <- sapply(unique_dates, function(d) as.numeric(format(d, "%Y")) + as.numeric(format(d, "%j"))/365)
   time_range <- range(raw_times)
   observed_times <- (raw_times - time_range[1]) / diff(time_range)
-  target_times <- (raw_target_times - time_range[1]) / diff(time_range)
   
-  n_obs <- length(observed_times)
-  sigma2 <- var(as.vector(Y_matrix), na.rm = TRUE)
-  alpha <- diff(range(observed_times)) / 2
-  cov_fun <- function(t1, t2) sigma2 * exp(-abs(t1 - t2) / alpha)
+  # Estimación MLE
+  cov_params <- estimate_alpha_MLE(observed_times, Y_matrix)
+  alpha <- cov_params$alpha; sigma2 <- cov_params$sigma2
+  if(verbose) message(sprintf("Universal: alpha=%.4f, sigma2=%.4f", alpha, sigma2))
+  cov_fun <- function(t1, t2) sigma2 * exp(-abs(t1 - t2)/alpha)
   
-  # Calcular la matriz de covarianza y aplicar regularización (nugget)
+  # Construcción de C y nugget extra si hace falta
   C <- outer(observed_times, observed_times, cov_fun)
-  diag(C) <- diag(C) + 1e-6  # Agregar nugget para estabilizar la inversa
+  diag(C) <- diag(C) + 1e-6
+  if(kappa(C) > 1e10) diag(C) <- diag(C) + 1e-4
   
-  # Construir la matriz extendida K_base según se incluya tendencia o no
-  if (trend) {
+  # Matriz extendida
+  n_obs <- length(observed_times)
+  if(trend) {
     T_mat <- cbind(1, observed_times)
-    K_base <- rbind(cbind(C, T_mat),
-                    cbind(t(T_mat), matrix(0, ncol = ncol(T_mat), nrow = ncol(T_mat))))
+    K_base <- rbind(cbind(C, T_mat), cbind(t(T_mat), matrix(0,2,2)))
   } else {
     one_vec <- rep(1, n_obs)
-    K_base <- rbind(cbind(C, one_vec),
-                    c(one_vec, 0))
+    K_base <- rbind(cbind(C, one_vec), c(one_vec, 0))
   }
   
-  # Verificar que K_base no tenga valores anómalos y, de ser necesario, regularizar
-  if(any(!is.finite(K_base))) {
-    stop("K_base contiene valores NA, NaN o Inf.")
-  }
-  if (kappa(K_base) > 1e12) {
-    diag(K_base)[1:n_obs] <- diag(K_base)[1:n_obs] + 1e-6
-  }
+  # Regularización de K_base
+  if(any(!is.finite(K_base))) stop("K_base contiene valores no finitos")
+  if(kappa(K_base) > 1e12) diag(K_base)[1:n_obs] <- diag(K_base)[1:n_obs] + 1e-3
   
-  # Ordenar según los tiempos observados
-  order_idx <- order(observed_times)
-  Y_matrix_ordered <- Y_matrix[, order_idx, drop = FALSE]
-  
-  # Predicción para cada tiempo objetivo
-  res_list <- lapply(seq_along(target_times), function(i) {
-    t_star <- target_times[i]
+  # Loop de predicción
+  out <- lapply(target_dates, function(d) {
+    t_star_raw <- as.numeric(format(as.Date(d), "%Y")) + as.numeric(format(as.Date(d), "%j"))/365
+    t_star <- (t_star_raw - time_range[1]) / diff(time_range)
+    # RHS
     c_vec <- sapply(observed_times, function(t) cov_fun(t, t_star))
+    rhs <- if(trend) c(c_vec, 1, t_star) else c(c_vec, 1)
     
-    # Construcción del vector RHS
-    rhs <- if (trend) {
-      c(c_vec, c(1, t_star))
-    } else {
-      c(c_vec, 1)
-    }
-    
-    # Resolver el sistema; si falla, se emplea la pseudoinversa
-    sol <- tryCatch(solve(K_base, rhs),
-                    error = function(e) MASS::ginv(K_base) %*% rhs)
-    
+    sol <- tryCatch(solve(K_base, rhs), error = function(e) MASS::ginv(K_base) %*% rhs)
     weights <- sol[1:n_obs]
-    pred_curve <- as.vector(Y_matrix_ordered %*% weights)
-    # Se utiliza tryCatch en la inversión de C para capturar potenciales errores
-    variance <- sigma2 - t(c_vec) %*% tryCatch(solve(C, c_vec),
-                                               error = function(e) {
-                                                 stop("Error al invertir C: ", e$message)
-                                               }) + sol[n_obs + 1]
-    
-    tibble(
-      date = target_dates[i],
-      coord = seq_along(pred_curve),
-      value = pred_curve,
-      variance = as.numeric(variance)
-    )
+    pred_curve <- as.vector(Y_matrix[, order(observed_times)] %*% weights)
+    var_term <- sigma2 - as.numeric(t(c_vec) %*% solve(C, c_vec)) + sol[n_obs + ifelse(trend,2,1)]
+    tibble(date = as.Date(d), coord = seq_along(pred_curve), value = pred_curve, variance = var_term)
   })
-  
-  bind_rows(res_list)
+  bind_rows(out)
 }
 
 # ===================================================
 # 5.5.1 Función de graficación
-# -----------------------
+# ===================================================
 
 plot_predicted_curves <- function(pred_df, ci = TRUE, alpha = 0.2) {
   # Definir el gráfico base con las curvas predichas
@@ -442,9 +509,19 @@ pred_df <- predict_universal_curve_df(fechas, trend = TRUE)
 plot_predicted_curves(pred_df, ci = TRUE)
 
 
+
+# Datos de prueba
+test_times <- seq(0, 10, length.out = 50)
+C <- 1.0 * exp(-as.matrix(dist(test_times))/1.0)
+Y_sim <- rmvnorm(100, mean = rep(0, 50), sigma = C)  # 100x50
+
+# Estimar parámetros
+params <- estimate_alpha_MLE(test_times, Y_sim)
+cat(sprintf("alpha=%.2f (1.00)\nsigma²=%.2f (1.00)", params$alpha, params$sigma2))
+
 # ===================================================
 # 5.5.2  validación cruzada temporal
-# -----------------------
+# ===================================================
 # Función de validación cruzada para Kriging Universal con mejoras
 cross_validate_kriging_universal <- function(years_ahead = 1:10, trend = TRUE) {
   unique_dates <- sort(unique(gdf_df$DATE))
@@ -524,12 +601,87 @@ plot_cv_results <- function(cv_df) {
 cv_result <- cross_validate_kriging_universal(years_ahead = 1:8)
 plot_cv_results(cv_result)
 
+# ===================================================
+# 5.6 Kriging Funcional Ordinario y Covarianza  OKFD
+# ===================================================
+# 5.6.1 Trace-variograma experimental
+delta_t <- diff(X_common)[1]
+trace_vario <- function(i, j) {
+  fi <- eval.fd(X_common, fd_obj$fd)[, i]
+  fj <- eval.fd(X_common, fd_obj$fd)[, j]
+  0.5 * sum((fi - fj)^2) * delta_t
+}
+
+dates     <- sort(unique(gdf_df$DATE))
+dates_num <- sapply(dates, function(d) year(d) + yday(d)/365)
+
+pairs <- expand.grid(i = seq_along(dates), j = seq_along(dates)) %>%
+  filter(i < j) %>%
+  mutate(
+    h     = abs(dates_num[i] - dates_num[j]),
+    gamma = mapply(trace_vario, i, j)
+  )
+
+psill0 <- var(pairs$gamma)
+max_h  <- max(pairs$h)
+
+# 5.6.2 Variograma 2D (tiempo vs espacio dummy)
+exp_vario <- pairs %>%
+  mutate(space = 0,
+         time  = h) %>%
+  group_by(time, space) %>%
+  summarise(gamma = mean(gamma), .groups = "drop")
+
+# Convertir a Spatial
+coordinates(exp_vario) <- ~ time + space
+
+# Ajuste de variograma exponencial sin nugget (o con nugget si se desea)
+best_model_2d <- vgm(psill = psill0, model = "Exp", range = max_h/3)
+
+# 5.6.3 Preparar matriz de curvas
+curve_mat   <- eval.fd(X_common, fd_obj$fd)[, seq_along(dates)]
+curve_mat_t <- t(curve_mat)
+n_curvas <- nrow(curve_mat_t)
+
+df_scores <- data.frame(
+  space = rep(0, n_curvas),
+  time  = dates_num,
+  curve_mat_t
+)
+colnames(df_scores) <- c("space", "time", paste0("V", seq_len(ncol(curve_mat_t))))
+coordinates(df_scores) <- ~ time + space
+
+# 5.6.4 Función de Kriging Funcional Ordinario
+krige_functional <- function(target_date, model2d = best_model_2d) {
+  t0     <- year(target_date) + yday(target_date)/365
+  newloc <- data.frame(space = 0, time = t0)
+  coordinates(newloc) <- ~ time + space
+  
+  preds <- sapply(seq_len(ncol(curve_mat_t)), function(k) {
+    vn <- paste0("V", k)
+    kr <- krige(
+      formula   = as.formula(paste(vn, "~ 1")),
+      locations = df_scores,
+      newdata   = newloc,
+      model     = model2d,
+      nmax      = 20
+    )
+    kr$var1.pred
+  })
+  preds
+}
+
+# Prueba rápida
+pred_ord <- krige_functional(as.Date("2025-01-01"))
+plot(X_common, pred_ord, type = "l",
+     main = "Kriging Funcional Ordinario (2025-01-01)",
+     xlab = "X_common", ylab = "Y_predicha")
 
 # ===================================================
-# 6. Predicción Funcional y Visualización (Kriging Funcional Puro)
+# 5.7. (Kriging Funcional Puro) kriging de traza
 # ===================================================
 
-target_date <- as.Date("2025-01-01") #fecha que se busca estimar mediante kriging funcional puro
+target_date <- as.Date("2025-01-01")
 
 predict_functional_curve <- function(target_date) {
   if (inherits(target_date, "Date")) {
@@ -582,7 +734,143 @@ plot_ly(data = df_pred, x = ~X) %>%
   layout(title = paste("Predicción Funcional para", target_date),
          xaxis = list(title = "X Relativa"),
          yaxis = list(title = "Y Relativa"))
+# ===================================================
+# 5.8 Función genérica de cross-validación para los 3 métodos
+# ===================================================
+cross_validate_all_models <- function(years_ahead = 1:5, trend = TRUE) {
+  models <- list(
+    universal = function(date) predict_universal_curve_df(date, trend = trend),
+    OKFD      = function(date) {
+      vec <- krige_functional(date)
+      tibble(date = as.Date(date), coord = X_common, value = vec)
+    },
+    traza     = function(date) {
+      pr <- predict_functional_curve(date)
+      tibble(date = as.Date(date), coord = X_common, value = pr$pred)
+    }
+  )
+  
+  unique_dates <- sort(unique(gdf_df$DATE))
+  dates_ordered <- unique_dates  # Ya están ordenadas cronológicamente
+  
+  results <- list()
+  for(h in years_ahead) {
+    for(i in seq_along(dates_ordered)) {
+      train_dates <- dates_ordered[1:i]
+      if(length(train_dates) == 0) next
+      
+      last_train_date <- max(train_dates)
+      target_test_date <- last_train_date + lubridate::years(h)
+      test_date_candidates <- which(dates_ordered >= target_test_date)
+      
+      if(length(test_date_candidates) == 0) next
+      test_date <- dates_ordered[test_date_candidates[1]]
+      
+      # Verificar diferencia mínima de h años
+      time_diff <- as.numeric(difftime(test_date, last_train_date, units = "days")) / 365.25
+      if(time_diff < h) next
+      
+      # Subset datos de entrenamiento
+      old_gdf <- gdf_df
+      old_Y <- Y_matrix
+      gdf_df <<- gdf_df[gdf_df$DATE %in% train_dates, ]
+      Y_matrix <<- Y_matrix[, 1:i, drop = FALSE]  # Asumiendo columnas ordenadas
+      
+      # Evaluar modelos
+      for(name in names(models)) {
+        pred_df <- tryCatch(models[[name]](test_date), error = function(e) NULL)
+        if(is.null(pred_df)) next
+        
+        real_curve <- old_Y[, which(dates_ordered == test_date)]
+        rmse <- sqrt(mean((pred_df$value - real_curve)^2, na.rm = TRUE))
+        
+        results[[length(results)+1]] <- tibble(
+          model = name,
+          horizon = h,
+          date = test_date,
+          rmse = rmse
+        )
+      }
+      
+      # Restaurar datos globales
+      gdf_df <<- old_gdf
+      Y_matrix <<- old_Y
+    }
+  }
+  bind_rows(results)
+}
 
+# Ejecución de la validación para horizontes 1:8
+cv_all <- cross_validate_all_models(years_ahead = 1:8, trend = TRUE)
+print(cv_all)
+ggplot(cv_all, aes(x = horizon, y = rmse, color = model)) + 
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE) +
+  labs(title = "Error de predicción por horizonte temporal", x = "Años hacia adelante", y = "RMSE")
+
+cv_summary <- cv_all %>%
+  group_by(model, horizon) %>%
+  summarise(mean_rmse = mean(rmse, na.rm = TRUE))
+
+ggplot(cv_summary, aes(x = horizon, y = mean_rmse, color = model)) + 
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(title = "RMSE promedio por horizonte temporal", x = "Años hacia adelante", y = "RMSE")
+
+
+table(cv_all$horizon, cv_all$model)
+# ===================================================
+# 5.9 Comparación de métodos de Kriging Funcional 
+# ===================================================
+# Fecha de predicción (ajusta según necesidad)
+fecha_obj <- as.Date("2025-06-01")
+
+# Predicciones de los tres métodos
+pred_univ_df <- predict_universal_curve_df(fecha_obj, trend = TRUE) %>% arrange(coord)
+pred_ord_vec <- krige_functional(fecha_obj)
+pred_trace_res <- predict_functional_curve(fecha_obj)
+
+# Combinar resultados en un data.frame
+# Usamos el mismo vector X_common como coordenada espacial
+df_compare <- data.frame(
+  coord     = X_common,
+  Universal = pred_univ_df$value,
+  Ordinario = pred_ord_vec,
+  Traza     = pred_trace_res$pred
+)
+
+# Transformar a formato largo para ggplot
+library(tidyr)
+long_compare <- df_compare %>%
+  pivot_longer(-coord, names_to = "Metodo", values_to = "Valor")
+
+# Gráfico comparativo de los tres métodos
+library(ggplot2)
+ggplot(long_compare, aes(x = coord, y = Valor, color = Metodo, linetype = Metodo)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Comparación de Métodos de Kriging Funcional",
+    x = "Coordenada espacial", y = "Valor predicho",
+    color = "Método", linetype = "Método"
+  ) +
+  theme_minimal()
+
+# Cálculo de la diferencia absoluta media (MAD) entre pares de métodos
+mad_univ_ord   <- mean(abs(df_compare$Universal - df_compare$Ordinario))
+mad_univ_traza <- mean(abs(df_compare$Universal - df_compare$Traza))
+mad_ord_traza  <- mean(abs(df_compare$Ordinario - df_compare$Traza))
+
+cat(sprintf(
+  "MAD Universal vs Ordinario: %.8f\n" , mad_univ_ord    ), sep = "")
+cat(sprintf(
+  "MAD Universal vs Traza:   %.8f\n" , mad_univ_traza  ), sep = "")
+cat(sprintf(
+  "MAD Ordinario vs Traza:   %.8f\n" , mad_ord_traza   ), sep = "")
+# Resumen de diferencias absolutas medias (MAD)
+mad_summary <- data.frame(
+  Pair = c("Universal-Ordinario", "Universal-Traza", "Ordinario-Traza"),
+  MAD  = c(mad_univ_ord, mad_univ_traza, mad_ord_traza)
+)
+print(mad_summary)
 # ===================================================
 # 7. Validación Cruzada Temporal para Kriging Funcional
 # ===================================================
@@ -704,52 +992,75 @@ plot_ly(data = df_boot, x = ~X) %>%
 # ===================================================
 # 9. Validación Estadística y Diagnóstico 
 # ===================================================
+
 # 9.1 Matriz de Covarianza entre Curvas Funcionales
+# --------------------------------------------------
 observed_times <- sapply(sort(unique(gdf_df$DATE)), function(d) {
   as.numeric(format(d, "%Y")) + as.numeric(format(d, "%j")) / 365
 })
+
 ordered_Y <- Y_matrix[, order(observed_times)]
 cov_matrix <- cov(t(ordered_Y), use = "pairwise.complete.obs")
-heatmap(cov_matrix, symm = TRUE, col = viridis(100), 
-        main = "Matriz de Covarianza entre Curvas Funcionales")
+
+# Visualización con heatmap
+heatmap(cov_matrix, 
+        symm = TRUE, 
+        col = viridis(100), 
+        main = "Matriz de Covarianza entre Curvas Funcionales",
+        xlab = "Curvas", 
+        ylab = "Curvas")
 
 # 9.2 Autocorrelación Temporal (lag-1)
+# ------------------------------------
 autocorr_lag1 <- sapply(2:ncol(ordered_Y), function(i) {
   cor(ordered_Y[, i], ordered_Y[, i - 1], use = "complete.obs")
 })
+
 mean_autocorr <- mean(autocorr_lag1, na.rm = TRUE)
-cat("Autocorrelación media lag-1:", round(mean_autocorr, 3), "\n")
+cat("\nAutocorrelación media lag-1:", round(mean_autocorr, 3), "\n")
 
 # 9.3 Validación Cruzada Extendida (Errores e IC por Fecha)
+# --------------------------------------------------------
 unique_dates <- sort(unique(gdf_df$DATE))
 cv_resultados <- data.frame(
   Fecha = unique_dates,
   RMSE = NA,
   IC95_Cobertura = NA
 )
+
 for (i in seq_along(unique_dates)) {
   fecha_eval <- unique_dates[i]
   target_curve <- Y_matrix[, i]
   Y_reducida <- Y_matrix[, -i]
-  fechas_reducidas <- unique_dates[-i]
+  
   pred_result <- tryCatch({
     predict_functional_curve(fecha_eval)
   }, error = function(e) return(NULL))
+  
   if (!is.null(pred_result)) {
+    # Cálculo de RMSE
     error_curve <- target_curve - pred_result$pred
     rmse_i <- sqrt(mean(error_curve^2, na.rm = TRUE))
+    
+    # Cálculo de cobertura del IC 95%
     sd_pred <- sqrt(pred_result$variance)
     lower <- pred_result$pred - 1.96 * sd_pred
     upper <- pred_result$pred + 1.96 * sd_pred
     dentro <- (target_curve >= lower) & (target_curve <= upper)
     cobertura <- mean(dentro, na.rm = TRUE)
+    
     cv_resultados$RMSE[i] <- rmse_i
     cv_resultados$IC95_Cobertura[i] <- cobertura
   }
 }
+
+# Resumen de resultados
+cat("\nResumen de Validación Cruzada:\n")
 print(summary(cv_resultados))
 
 # 9.4 Gráficos de Validación
+# --------------------------
+# Gráfico de RMSE
 ggplot(cv_resultados, aes(x = Fecha)) +
   geom_line(aes(y = RMSE), color = "tomato", size = 1.2) +
   geom_point(aes(y = RMSE), color = "tomato") +
@@ -759,10 +1070,282 @@ ggplot(cv_resultados, aes(x = Fecha)) +
        y = "RMSE", x = "Fecha") +
   theme_minimal()
 
+# Gráfico de cobertura de IC
 ggplot(cv_resultados, aes(x = Fecha)) +
   geom_line(aes(y = IC95_Cobertura), color = "blue", size = 1.2) +
   geom_point(aes(y = IC95_Cobertura), color = "blue") +
   geom_hline(yintercept = 0.95, linetype = "dashed", color = "gray40") +
   labs(title = "Cobertura Empírica de IC 95% por Fecha",
        y = "Cobertura", x = "Fecha") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, 1))
+
+
+# ===================================================
+# 10. Validación de Supuestos y Métricas Clave
+# ===================================================
+
+# 10.1 Calidad y estructura de los datos
+# --------------------------------------
+# (a) Verificación de columnas requeridas
+cols_req <- c("DATE", "X", "Y")
+missing_cols <- setdiff(cols_req, names(gdf_df))
+if (length(missing_cols) > 0) {
+  stop("Faltan columnas requeridas: ", paste(missing_cols, collapse = ", "))
+}
+
+# (b) Proporción de valores faltantes
+na_prop <- sapply(gdf_df[, cols_req], function(v) mean(is.na(v)))
+cat("\nProporción de valores faltantes:\n")
+print(na_prop)
+
+# (c) Análisis de fechas
+na_dates <- sum(is.na(gdf_df$DATE))
+date_range <- range(gdf_df$DATE, na.rm = TRUE)
+cat("\nNA en fechas:", na_dates)
+cat("\nRango temporal:", format(date_range[1], "%Y-%m-%d"), "a", 
+    format(date_range[2], "%Y-%m-%d"), "\n")
+
+# (d) Densidad espacial
+library(spatstat)
+pp <- ppp(gdf_df$X, gdf_df$Y,
+          window = owin(xrange = range(gdf_df$X), yrange = range(gdf_df$Y)))
+plot(density(pp), 
+     main = "Mapa de densidad de puntos",
+     xlab = "Coordenada X",
+     ylab = "Coordenada Y")
+
+# 10.2 Construcción de Y_matrix
+# -----------------------------
+cat("\nDimensiones de Y_matrix:", dim(Y_matrix))
+cat("\nProporción de NA en Y_matrix:", round(mean(is.na(Y_matrix)), 4), "\n")
+
+# 10.3 Integridad de la interpolación
+# -----------------------------------
+na_after_interp <- apply(Y_matrix, 2, function(col) mean(is.na(col)))
+cat("\nNA post-interpolación (min, med, max):",
+    round(min(na_after_interp), 3), 
+    round(median(na_after_interp), 3),
+    round(max(na_after_interp), 3), "\n")
+
+# 10.5 Análisis FPCA
+# ------------------
+# (a) Varianza explicada
+cumvar <- cumsum((fpca$values) / sum(fpca$values))
+cat("\nComponentes para ≥95% varianza:", which(cumvar >= 0.95)[1], "\n")
+
+# (b) Gráfico de decaimiento de eigenvalores
+plot(fpca$values, type = "b", 
+     main = "Decaimiento de eigenvalores",
+     xlab = "Componente",
+     ylab = "Eigenvalor")
+
+# 10.6 Análisis de variogramas
+# ----------------------------
+var_initial <- var(data_vario[[paste0("score.", componentes_activos[1])]], na.rm = TRUE)
+fit0 <- fit_list[[1]]
+cat("\nSemivariograma - Componente 1:\n")
+cat("  Varianza inicial:", signif(var_initial, 3), "\n")
+cat("  Nugget:", signif(fit0$psill[1], 3), "\n")
+cat("  Sill:", signif(sum(fit0$psill), 3), "\n")
+cat("  Range:", signif(fit0$range[2], 3), "\n")
+
+# 10.7 Validación de Kriging
+# --------------------------
+# (a) Relación Nugget-to-Sill
+nugget <- fit0$psill[1]
+sill <- sum(fit0$psill)
+cat("\nNugget-to-Sill ratio:", round(nugget/sill, 3), "\n")
+
+# (b) Métricas globales
+rmse_overall <- mean(cv_result$rmse, na.rm = TRUE)
+coverage_overall <- mean(
+  (cv_result$rmse - cv_result$sd <= cv_result$rmse) & 
+    (cv_result$rmse + cv_result$sd >= cv_result$rmse), 
+  na.rm = TRUE
+)
+
+cat("\nMétricas globales de predicción:\n")
+cat("  RMSE:", signif(rmse_overall, 3), "\n")
+cat("  Cobertura IC95%:", round(coverage_overall*100, 1), "%\n")
+
+
+# ===================================================
+# 11. Ajustes Avanzados
+# ===================================================
+
+# 11.1 Matriz de penalización
+Pmat_correct <- eval.penalty(final_basis, Lfdobj = 2)
+cond_P_correct <- kappa(Pmat_correct)
+cat("\nNúmero de condición de P (segundo orden):", 
+    format(cond_P_correct, scientific = TRUE, digits = 3), "\n")
+
+# 11.2 Optimización de lambda
+# ---------------------------
+lambda_grid <- 10^seq(-12, 0, length.out = 50)
+gcv_mean <- numeric(length(lambda_grid))
+
+for (i in seq_along(lambda_grid)) {
+  lam <- lambda_grid[i]
+  fdPar_i <- fdPar(final_basis, lambda = lam)
+  sb_i <- smooth.basis(X_common, Y_matrix, fdPar_i)
+  gcv_mean[i] <- mean(sb_i$gcv, na.rm = TRUE)
+}
+
+# Resultados de optimización
+lambda_opt_gcv <- lambda_grid[which.min(gcv_mean)]
+cat("\nLambda óptimo (GCV):", format(lambda_opt_gcv, scientific = TRUE), "\n")
+
+# 11.3 RMSE relativo
+# ------------------
+Y_range <- max(gdf_df$Y, na.rm = TRUE) - min(gdf_df$Y, na.rm = TRUE)
+rmse_rel <- rmse_overall / Y_range * 100
+cat("\nRMSE relativo:", round(rmse_rel, 2), "% del rango de Y\n")
+
+# 11.4 Ajuste de intervalos de confianza al 90%
+# ---------------------------------------------
+multiplier <- qnorm(0.95)  # 1.645 para IC 90%
+
+pred_df_adj <- pred_df %>%
+  mutate(
+    lower_90 = value - multiplier * sqrt(variance),
+    upper_90 = value + multiplier * sqrt(variance)
+  )
+
+# Visualización
+ggplot(pred_df_adj, aes(x = coord, y = value, group = factor(date))) +
+  geom_line(aes(color = factor(date))) +
+  geom_ribbon(aes(ymin = lower_90, ymax = upper_90, fill = factor(date)), 
+              alpha = 0.2) +
+  labs(
+    title = "Predicciones con Intervalos de Confianza al 90%",
+    x = "Coordenada espacial",
+    y = "Valor predicho",
+    color = "Fecha", 
+    fill = "Fecha"
+  ) +
   theme_minimal()
+
+
+# ===================================================
+
+
+
+# Carga del paquete fda para construir bases funcionales
+library(fda)
+
+# Dominio de definición (aquí [0,1])
+rangeval <- c(0, 1)
+
+# Rango de nbasis a explorar (de 20 a 80)
+nbasis_vals <- 20:80
+
+# Rango de lambda en escala logarítmica (de 1e-10 a 1e0)
+lambda_vals <- 10^seq(-10, 0, length.out = 11)
+
+# Inicializar variables para la mejor combinación encontrada
+bestCond <- Inf
+bestType <- NULL
+bestNbasis <- NA
+bestLambda <- NA
+
+# Lista de tipos de bases a considerar
+# (omitiendo las gaussianas por no existir función directa en fda)
+tipos_base <- c('bspline', 'fourier', 'monomial')
+
+for (tipo in tipos_base) {
+  for (nb in nbasis_vals) {
+    # Crear objeto de base correspondiente
+    if (tipo == 'bspline') {
+      basis_obj <- create.bspline.basis(rangeval, nbasis = nb)
+    } else if (tipo == 'fourier') {
+      # Fourier: asegurar un número impar de funciones base para incluir constante
+      nb_use <- ifelse(nb %% 2 == 0, nb + 1, nb)
+      basis_obj <- create.fourier.basis(rangeval, nbasis = nb_use)
+    } else if (tipo == 'monomial') {
+      basis_obj <- create.monomial.basis(rangeval, nbasis = nb)
+    }
+    # Calcular matriz de Gram y matriz de penalización (segunda derivada)
+    Cmat <- inprod(basis_obj, basis_obj, Lfdobj1 = 0, Lfdobj2 = 0, rng = rangeval)
+    Rmat <- eval.penalty(basis_obj, Lfdobj = 2, rng = rangeval)
+    # Explorar valores de lambda y computar condición
+    for (lam in lambda_vals) {
+      M <- Cmat + lam * Rmat
+      # Calcular número de condición (manejo de posibles errores numéricos)
+      cond_val <- try(kappa(M), silent = TRUE)
+      if (inherits(cond_val, 'try-error')) next
+      # Revisar estabilidad numérica
+      if (cond_val < 1e12) {
+        # Actualizar mejor combinación si mejora el número de condición
+        if (cond_val < bestCond) {
+          bestCond <- cond_val
+          bestType <- tipo
+          bestNbasis <- nb
+          bestLambda <- lam
+        }
+      }
+    }
+  }
+}
+
+# Mostrar resultado final o diagnóstico
+if (is.null(bestType)) {
+  cat('No se encontró una combinación estable.\n')
+} else {
+  cat('Mejor base encontrada:', bestType, '\n')
+  cat('Nbasis óptimo:', bestNbasis, '\n')
+  cat('Lambda óptimo:', bestLambda, '\n')
+  cat('Número de condición obtenido:', bestCond, '\n')
+}
+
+
+library(fda)
+
+# Dominio [0, 1] y puntos de evaluación
+X <- seq(0, 1, length.out = 200)
+Y <- sin(2 * pi * X)  # función a reconstruir
+Y_noisy <- Y + rnorm(length(Y), 0, 0.05)  # versión con ruido
+
+# Datos para smooth.basis
+rangeval <- c(0, 1)
+
+
+# Fourier (mejor opción encontrada)
+nbasis_fourier <- 20
+basis_fourier <- create.fourier.basis(rangeval, nbasis_fourier)
+fdPar_f <- fdPar(basis_fourier, lambda = 1e-10)
+fit_fourier <- smooth.basis(X, Y_noisy, fdPar_f)
+
+# B-spline (comparativa)
+nbasis_bspline <- 70  # puedes ajustar este valor también
+basis_bspline <- create.bspline.basis(rangeval, nbasis_bspline)
+fdPar_b <- fdPar(basis_bspline, lambda = 1e-6)
+fit_bspline <- smooth.basis(X, Y_noisy, fdPar_b)
+
+# Funciones ajustadas
+Y_fourier <- eval.fd(X, fit_fourier$fd)
+Y_bspline <- eval.fd(X, fit_bspline$fd)
+
+# Error cuadrático medio
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+cat("RMSE Fourier:", rmse(Y, Y_fourier), "\n")
+cat("RMSE B-spline:", rmse(Y, Y_bspline), "\n")
+
+# Funciones base de Fourier
+matplot(eval.basis(X, basis_fourier), type = 'l', main = "Funciones base Fourier", col = rainbow(nbasis_fourier), lty = 1)
+
+# Funciones base B-spline
+matplot(eval.basis(X, basis_bspline), type = 'l', main = "Funciones base B-spline", col = rainbow(nbasis_bspline), lty = 1)
+
+image(eval.penalty(basis_fourier, 2), main = "Penalización Fourier")
+image(eval.penalty(basis_bspline, 2), main = "Penalización B-spline")
+
+plot(X, Y, type = 'l', col = 'black', lwd = 2, ylim = range(c(Y, Y_fourier, Y_bspline)), main = "Comparación reconstrucciones")
+lines(X, Y_fourier, col = 'blue', lwd = 2, lty = 2)
+lines(X, Y_bspline, col = 'red', lwd = 2, lty = 3)
+legend("topright", legend = c("Original", "Fourier", "B-spline"),
+       col = c("black", "blue", "red"), lty = c(1,2,3), lwd = 2)
+# ===================================================
+
+
+
